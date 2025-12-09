@@ -5,7 +5,8 @@ import logging
 
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
+from telegram.error import BadRequest
 
 load_dotenv()
 
@@ -17,33 +18,6 @@ if not BOT_TOKEN:
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-async def search_music_vk(query: str) -> List[dict]:
-    """Ищет треки по текстовому запросу через VK Music."""
-    if not VK_TOKEN:
-        logger.warning("Токен VK не настроен, использую iTunes API")
-        return await search_music_itunes(query)
-
-    try:
-        from vkpymusic import Service
-        service = Service.parse_config()
-        if not service:
-            service = Service(token_path="vk_config.txt")
-        
-        tracks_raw = list(service.search_songs_by_text(query, count=5))
-        tracks = []
-        for t in tracks_raw:
-            tracks.append({
-                "title": t.title,
-                "artist": t.artist,
-                "link": f"https://vk.com/audio{t.owner_id}_{t.id}",
-                "duration": t.duration
-            })
-        return tracks
-    except Exception as e:
-        logger.error(f"Ошибка VK API: {e}, переключаюсь на iTunes")
-        return await search_music_itunes(query)
 
 
 async def search_music_itunes(query: str) -> List[dict]:
@@ -63,21 +37,32 @@ async def search_music_itunes(query: str) -> List[dict]:
 
     tracks = []
     for item in data.get("results", [])[:5]:
+        preview_url = item.get("previewUrl", "")
         tracks.append({
             "title": item.get("trackName", "Без названия"),
             "artist": item.get("artistName", "Неизвестный исполнитель"),
             "link": item.get("trackViewUrl", ""),
-            "preview": item.get("previewUrl", "")
+            "preview": preview_url,
+            "has_preview": bool(preview_url)
         })
 
     return tracks
 
 
+async def download_preview(preview_url: str) -> bytes:
+    """Загружает 30-секундный попревью трека на основе iTunes API."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(preview_url)
+        resp.raise_for_status()
+        return resp.content
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🎵 Привет! Отправь мне текст, а я попробую найти подходящую музыку.\n\n"
-        "🔍 Поиск выполняется через iTunes/Apple Music (\u0440аботает в России без VPN).\n\n"
-        "🎶 Например: `linkin park numb` или `Oxxxymiron город под подошвой`",
+        "🔍 Поиск выполняется через iTunes/Apple Music (работает в России без VPN).\n\n"
+        "🎶 Например: `linkin park numb` или `Oxxxymiron город под подошвой`\n\n"
+        "✨ Кликни на песню, и я отправлю 30-секундный попревью!",
         parse_mode="Markdown",
     )
 
@@ -87,15 +72,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🎵 Просто напиши, что ты хочешь найти:\n"
         "• Исполнителя или название песни\n"
         "• Описание настроения или жанр\n\n"
-        "🌍 Поиск работает через iTunes API — доступно в России без VPN."
+        "🌍 Поиск работает через iTunes API — доступно в России без VPN.\n\n"
+        "🔗 Нажми на песню, я отправлю попревью (30 секунд) в Telegram."
     )
 
 
 def build_tracks_keyboard(tracks: List[dict]) -> InlineKeyboardMarkup:
     buttons = []
-    for t in tracks:
+    for i, t in enumerate(tracks):
         text = f"{t['artist']} - {t['title']}" if t.get("artist") else t.get("title", "Трек")
-        buttons.append([InlineKeyboardButton(text=text[:60], url=t["link"])])
+        preview_indicator = "🔊" if t.get("has_preview") else "🔗"
+        button_text = f"{preview_indicator} {text[:55]}"
+        buttons.append([InlineKeyboardButton(text=button_text, callback_data=f"preview_{i}")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -120,17 +108,80 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.edit_text("🔍 Ничего не нашлось. Попробуй сформулировать запрос по‑другому.")
         return
 
+    # Сохрани треки в context для Каллбэка
+    context.user_data["tracks"] = tracks
+
     text_lines = []
     for i, t in enumerate(tracks, start=1):
         line = f"{i}. {t.get('artist', 'Неизвестный исполнитель')} — {t.get('title', 'Без названия')}"
+        if t.get("has_preview"):
+            line += " [🔊 есть попревью]"
         text_lines.append(line)
 
-    text_lines.append("\n👆 Нажми на кнопку, чтобы прослушать трек в Apple Music/iTunes.")
+    text_lines.append("\n🔊 Кликни для скачивания 30-секундного попревью (AAC-формат).")
+    text_lines.append("🔗 Либо кликни для открытия в Apple Music/iTunes.")
 
     await msg.edit_text(
         "\n".join(text_lines),
         reply_markup=build_tracks_keyboard(tracks),
     )
+
+
+async def handle_preview_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    # Получи индекс трека из callback_data
+    track_index = int(query.data.split("_")[1])
+    tracks = context.user_data.get("tracks", [])
+
+    if track_index >= len(tracks):
+        await query.edit_message_text("❌ Ошибка при загружке.")
+        return
+
+    track = tracks[track_index]
+
+    # Проверь есть ли попревью
+    if not track.get("preview"):
+        await query.edit_message_text(
+            f"❌ {track['artist']} - {track['title']}\n\n"
+            "Попревью не доступна. Открыть в Apple Music: " + track["link"]
+        )
+        return
+
+    # Начни показ статуса
+    await query.edit_message_text(
+        f"🔊 {track['artist']} - {track['title']}\n\nЗагружаю попревью..."
+    )
+
+    try:
+        # Загружай попревью
+        audio_data = await download_preview(track["preview"])
+        file_name = f"{track['artist']} - {track['title']}.aac".replace("/", "").replace("\\", "")
+
+        # Отправь в чат
+        await query.message.reply_audio(
+            audio=audio_data,
+            title=track["title"],
+            performer=track["artist"],
+            caption=f"🎵 30-секундный попревью от iTunes\n\n🔗 Открыть полный трек: {track['link']}"
+        )
+
+        # Обнови сообщение
+        await query.edit_message_text(
+            f"✔️ {track['artist']} - {track['title']}\n\
+Попревью отправлена в чат!\n\n🔗 Apple Music: {track['link']}"
+        )
+    except BadRequest as e:
+        logger.error(f"Ошибка Telegram: {e}")
+        await query.edit_message_text(
+            f"❌ Не удалось отправить аудио.\n\n🔗 Открыть в Apple Music: {track['link']}"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
+        await query.edit_message_text(
+            f"❌ Ошибка при загружке попревью.\n\n🔗 Открыть в Apple Music: {track['link']}"
+        )
 
 
 def main() -> None:
@@ -139,6 +190,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(CallbackQueryHandler(handle_preview_button, pattern=r"^preview_\d+$"))
 
     logger.info("🚀 Бот запущен!")
     application.run_polling()
