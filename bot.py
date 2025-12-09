@@ -1,5 +1,4 @@
 import os
-import asyncio
 from dotenv import load_dotenv
 from typing import List
 
@@ -10,7 +9,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MUSIC_API_TOKEN = os.getenv("MUSIC_API_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set in .env")
@@ -96,15 +94,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
-async def main() -> None:
+def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    await application.run_polling()
+    application.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
