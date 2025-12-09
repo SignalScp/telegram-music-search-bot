@@ -19,12 +19,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set in .env")
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
 async def search_music_itunes(query: str) -> List[dict]:
-    """Ищет треки основному iTunes Search API высокой релевантности."""
+    """Ищет треки основному iTunes Search API."""
     url = "https://itunes.apple.com/search"
     params = {
         "term": query,
@@ -49,12 +52,11 @@ async def search_music_itunes(query: str) -> List[dict]:
     return tracks
 
 
-async def download_from_youtube(artist: str, title: str) -> str:
-    """Загружает полную песню с YouTube используя yt-dlp.
-    Возвращает путь к файлу MP3 или не Ноне, если не найден."""
+def download_from_youtube_sync(artist: str, title: str) -> bytes:
+    """Синхронная функция для загружки с YouTube через yt-dlp."""
     search_query = f"{artist} {title}"
+    logger.info(f"🔍 Поиск YouTube: {search_query}")
     
-    # Утверждаю что yt-dlp запускается в виртуальном топнистек
     with tempfile.TemporaryDirectory() as tmpdir:
         output_path = os.path.join(tmpdir, "%(title)s.%(ext)s")
         
@@ -64,61 +66,75 @@ async def download_from_youtube(artist: str, title: str) -> str:
             "--audio-format", "mp3",
             "--audio-quality", "192",
             "-o", output_path,
+            "--quiet",
+            "--no-warnings",
             "ytsearch:" + search_query
         ]
         
         try:
-            # Прокарую asyncio.to_thread для блокирующего вызова
-            result = await asyncio.to_thread(
-                subprocess.run,
+            logger.info(f"⚡ Начинаю загружку YouTube...")
+            result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=120
             )
             
+            logger.info(f"🔍 Ответ yt-dlp (return code: {result.returncode})")
+            
             if result.returncode != 0:
-                logger.error(f"Ошибка yt-dlp: {result.stderr}")
+                logger.error(f"❌ yt-dlp error stdout: {result.stdout}")
+                logger.error(f"❌ yt-dlp error stderr: {result.stderr}")
                 return None
             
-            # Находи скачанный файл
+            # Проверь какие файлы были скачаны
             files = os.listdir(tmpdir)
+            logger.info(f"📄 Файлы в tmpdir: {files}")
+            
             mp3_files = [f for f in files if f.endswith(".mp3")]
             
             if not mp3_files:
-                logger.error("Ошибка: MP3 файл не найден")
+                logger.error("❌ MP3 файлы не найдены")
                 return None
             
             file_path = os.path.join(tmpdir, mp3_files[0])
+            file_size = os.path.getsize(file_path)
+            logger.info(f"🎵 Мп3 скачан: {mp3_files[0]} ({file_size / 1024 / 1024:.2f} MB)")
             
-            # Обычные бинарные данные аудиофайла используются перед гружкой в Telegram
+            # Обычные данные аудиофайла
             with open(file_path, "rb") as f:
                 audio_data = f.read()
             
+            logger.info(f"🚀 Все готово! Протагружено {len(audio_data) / 1024 / 1024:.2f} MB")
             return audio_data
         
         except subprocess.TimeoutExpired:
-            logger.error("Таймаут yt-dlp: залога численности")
+            logger.error("❌ Таймаут yt-dlp (120 секунд)")
             return None
         except Exception as e:
-            logger.error(f"Ошибка yt-dlp: {e}")
+            logger.error(f"❌ Ошибка yt-dlp: {type(e).__name__}: {e}")
             return None
+
+
+async def download_from_youtube(artist: str, title: str) -> bytes:
+    """Асинхронная загружка с YouTube."""
+    return await asyncio.to_thread(download_from_youtube_sync, artist, title)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "🎵 Привет! Отправь мне название песни, и я найду для тебя полную версию!\n\n"
-        "🔍 Поиск со высокой релевантностью (работает в России).\n\n"
-        "🎶 Отправь: `linkin park numb` или `oxxxymiron город под подошвой`\n\n"
-        "⚡ Загруживается полная мп3 по клику.",
+        "🎵 Привет! Отправь мне название песни, и я найду тае для тебя!\n\n"
+        "🔍 Поиск со высокой релевантностью.\n\n"
+        "🎶 Отправь: `linkin park numb` или `oxxxymiron город`\n\n"
+        "⚡ Кликни — скачиваю полные MP3.",
         parse_mode="Markdown",
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "🎵 Просто напиши название песни и исполнителя.\n\n"
-        "🔊 Кликни на трек — бот загружит полную MP3."
+        "🎵 Просто напиши название песни.\n\n"
+        "🔊 Кликни — бот скачиваю полную MP3."
     )
 
 
@@ -138,20 +154,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not query:
         return
 
-    msg = await update.message.reply_text("🔍 Поиск треков по релевантности...")
+    msg = await update.message.reply_text("🔍 Поиск треков...")
+    logger.info(f"🔍 Поиск: {query}")
 
     try:
         tracks = await search_music_itunes(query)
     except Exception as e:
-        logger.error(f"Ошибка поиска: {e}")
-        await msg.edit_text("❌ Ошибка при поиске.")
+        logger.error(f"❌ Ошибка iTunes: {e}")
+        await msg.edit_text("❌ Ошибка поиска.")
         return
 
     if not tracks:
-        await msg.edit_text("🔍 Ничего не найдено. Попробуй другой запрос.")
+        await msg.edit_text("🔍 Ничего не найдено.")
         return
 
-    # Сохрани треки в context для каллбека
     context.user_data["tracks"] = tracks
 
     text_lines = []
@@ -159,7 +175,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         line = f"{i}. {t.get('artist', 'Неизвестный')} — {t.get('title', 'Без названия')}"
         text_lines.append(line)
 
-    text_lines.append("\n🔊 Кликни для загружки полного MP3.")
+    text_lines.append("\n🔊 Кликни для скачивания MP3.")
 
     await msg.edit_text(
         "\n".join(text_lines),
@@ -171,7 +187,6 @@ async def handle_download_button(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
 
-    # Получи индекс трека
     track_index = int(query.data.split("_")[1])
     tracks = context.user_data.get("tracks", [])
 
@@ -180,35 +195,40 @@ async def handle_download_button(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     track = tracks[track_index]
+    logger.info(f"🎵 Начинаю скачивание: {track['artist']} - {track['title']}")
+    
     await query.edit_message_text(
-        f"🔊 {track['artist']} - {track['title']}\n\nЗагружаю песню...\n(иногда 1-2 минуты)"
+        f"🎵 {track['artist']} - {track['title']}\n\n⚡ Гружу с YouTube...\n(может зайти до 2-3 минут)"
     )
 
     try:
-        # Загружаю полную MP3
+        logger.info("🎵 Ожидаю скачивание...")
         audio_data = await download_from_youtube(track["artist"], track["title"])
 
         if not audio_data:
+            logger.error("❌ Не удалось скачать audio_data")
             await query.edit_message_text(
-                f"❌ Не удалось найти песню на YouTube.\n\nОткрыть в iTunes: {track['link']}"
+                f"❌ Не нашлась на YouTube.\n\nОткрыть в iTunes: {track['link']}"
             )
             return
 
-        # Отправь мп3
+        logger.info(f"🚀 Отправляю {len(audio_data) / 1024 / 1024:.2f} MB в Telegram")
+        
         await query.message.reply_audio(
             audio=audio_data,
             title=track["title"],
             performer=track["artist"],
-            caption=f"🎵 {track['artist']}\n{track['title']}"
+            caption=f"🎵 {track['artist']} - {track['title']}"
         )
 
         await query.edit_message_text(
-            f"✔️ {track['artist']} - {track['title']}\nПесня отправлена!"
+            f"✔️ {track['artist']} - {track['title']}\nПесня в чате!"
         )
+        logger.info("✔️ Успешно отправлена!")
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
+        logger.error(f"❌ Ошибка отправки: {type(e).__name__}: {e}")
         await query.edit_message_text(
-            f"❌ Ошибка при загружке.\n\n{track['artist']} - {track['title']}"
+            f"❌ Ошибка на моем конце.\n{track['artist']} - {track['title']}"
         )
 
 
